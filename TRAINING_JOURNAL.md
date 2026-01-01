@@ -54,22 +54,14 @@ This is a general pattern: **fast signal source + slow execution venue**. The sa
 
 This creates an 18-dimensional state that captures both underlying asset dynamics AND prediction market microstructure. See [README.md](README.md) for the full feature breakdown.
 
-### Sparse Reward Signal (Current Approach)
+### The Reward Problem
 
-After Phase 1's reward shaping failed (see Training Evolution below), we switched to sparse rewards: the agent only receives reward when a position closes. No intermediate feedback while holding.
+RL agents need reward signals to learn. In trading, the obvious choice is profit—but how and when do you give that signal?
 
-**Current approach (Phase 4+)**: The reward is based on **share-based PnL**, which reflects actual binary market economics. When a position closes:
+- **Dense rewards** (every tick): Easier credit assignment, but prone to gaming
+- **Sparse rewards** (on trade close): Harder to learn, but honest signal
 
-```
-shares = dollars / entry_price
-pnl = (exit_price - entry_price) × shares
-```
-
-This amplifies returns from low-probability entries proportionally. Buy at 0.30 and you get 3.33 shares per dollar vs 1.43 shares at 0.70.
-
-**Historical note**: Phases 1-3 used probability-based PnL: `(exit - entry) × dollars`. Phase 4 switched to share-based after discovering it better matches actual market mechanics, resulting in a 4.5x improvement in ROI.
-
-This sparsity makes credit assignment harder. The agent takes actions every tick but only learns from PnL when positions close. Phase 1 tried to solve this with dense shaping rewards—it backfired.
+We started with dense rewards (Phase 1) and it backfired. The agent gamed the micro-bonuses instead of learning to trade. The fix was sparse rewards: reward only when a position closes, based on actual PnL. See Training Evolution below for the full story.
 
 ---
 
@@ -121,14 +113,7 @@ The agent learned to game the reward function:
 
 Buffer win rate showed 90%+ (counting bonus-positive experiences) while actual trade win rate was 20%. The agent was optimizing the reward function, not the underlying goal.
 
-### Diagnosis: Reward Shaping Backfired
-
-The divergence between buffer win rate and cumulative win rate revealed the problem:
-
-- **Buffer win rate**: % of experiences with reward > 0 (includes shaping bonuses)
-- **Cumulative win rate**: % of closed trades that were profitable
-
-When these diverge, the agent is learning the wrong thing.
+**The tell**: Buffer win rate (% of experiences with reward > 0) diverged from trade win rate (% of profitable trades). When these diverge, the agent is learning the wrong thing.
 
 ---
 
@@ -169,15 +154,7 @@ norm_reward = (raw_pnl - running_mean) / (running_std + 1e-8)
 
 **Final**: $10.93 PnL on $20 max exposure = **55% ROI**
 
-### The Win Rate Paradox
-
-Win rate settled at ~21%, well below random (33%). But the agent is profitable.
-
-Why? Binary markets have asymmetric payoffs. When you buy an UP token at probability 0.40:
-- Win: pay $0.40, receive $1.00 → profit $0.60
-- Lose: pay $0.40, receive $0.00 → loss $0.40
-
-You can win 40% of the time and break even. Win 21% of the time but pick your spots at low probabilities? Still profitable.
+**Why 21% win rate is profitable**: Binary markets have asymmetric payoffs. Buy UP at 0.40: win pays $0.60, lose costs $0.40. You can win 40% of the time and break even. Win 21% but pick your spots at low probabilities? Still profitable.
 
 ---
 
@@ -197,22 +174,6 @@ You can win 40% of the time and break even. Win 21% of the time but pick your sp
 3. Simplified actions (7 → 3) - learn *when* before *how much*
 4. Smaller buffer (2048 → 512) - faster updates
 5. Reset reward normalization stats
-
----
-
-### Technical Notes
-
-See [README.md](README.md) for full architecture and hyperparameters.
-
-### Value Loss Spikes
-
-Phase 2 showed value loss spikes as the critic adapted to pure PnL:
-- Update 1: 149.5 (reward scale change)
-- Update 7: 69.95 (large reward variance)
-- Updates 8-9: 18-20 (stabilizing)
-- Update 10: 7.16 (settled)
-
-The critic learned to predict a noisier, more meaningful signal.
 
 ---
 
