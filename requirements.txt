@@ -6,6 +6,7 @@ safetensors>=0.4.0
 # Web/API
 aiohttp>=3.9.0
 websockets>=12.0
+requests>=2.31.0
 
 # Dashboard
 flask>=3.0.0
