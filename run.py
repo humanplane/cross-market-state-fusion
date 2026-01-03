@@ -11,6 +11,10 @@ Usage:
     python run.py rl --train          # Train RL strategy
     python run.py rl --train --dashboard  # Train with web dashboard
 """
+# Load .env file FIRST before any other imports that might use env vars
+from dotenv import load_dotenv
+load_dotenv(override=True)  # override=True ensures .env takes precedence over shell env
+
 import asyncio
 import argparse
 import copy
@@ -22,6 +26,7 @@ from typing import Dict, List, Optional
 
 sys.path.insert(0, ".")
 from helpers import get_15m_markets, BinanceStreamer, OrderbookStreamer, Market, FuturesStreamer, get_logger
+from helpers.wallet import PolymarketWallet, OrderSide, create_wallet
 from strategies import (
     Strategy, MarketState, Action,
     create_strategy, AVAILABLE_STRATEGIES,
@@ -54,12 +59,29 @@ class Position:
 
 class TradingEngine:
     """
-    Paper trading engine with strategy harness.
+    Trading engine with strategy harness.
+    Supports both paper trading and live execution.
     """
 
-    def __init__(self, strategy: Strategy, trade_size: float = 10.0):
+    def __init__(self, strategy: Strategy, trade_size: float = 10.0, live: bool = False, wallet: PolymarketWallet = None):
         self.strategy = strategy
         self.trade_size = trade_size
+        self.live = live
+        self.wallet = wallet
+
+        # Safety checks for live trading
+        if self.live:
+            if not self.wallet:
+                raise ValueError("Wallet required for live trading")
+            print("\n" + "=" * 60)
+            print("⚠️  LIVE TRADING MODE - REAL MONEY AT RISK")
+            print("=" * 60)
+            balance = self.wallet.get_balance()
+            print(f"Wallet balance: ${balance:.2f}")
+            if balance < trade_size:
+                raise ValueError(f"Insufficient balance: ${balance:.2f} < ${trade_size}")
+            print(f"Trade size: ${trade_size:.2f}")
+            print("=" * 60 + "\n")
 
         # Streamers
         self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
@@ -133,12 +155,16 @@ class TradingEngine:
             self.orderbook_streamer.clear_stale(active_cids)
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
-        """Execute paper trade with flexible sizing."""
+        """Execute trade with flexible sizing. Supports paper and live modes."""
         if action == Action.HOLD:
             return
 
         pos = self.positions.get(cid)
         if not pos:
+            return
+
+        market = self.markets.get(cid)
+        if not market:
             return
 
         price = state.prob
@@ -148,19 +174,52 @@ class TradingEngine:
         if pos.size > 0:
             if action.is_sell and pos.side == "UP":
                 shares = pos.size / pos.entry_price
-                pnl = (price - pos.entry_price) * shares
-                self._record_trade(pos, price, pnl, "CLOSE UP", cid=cid)
-                self.pending_rewards[cid] = pnl  # Pure realized PnL reward
+                exit_price = price  # Default to mid-price
+
+                # Live: execute sell order (market order = FOK)
+                if self.live and self.wallet:
+                    result = self.wallet.place_market_order(
+                        token_id=market.token_up,
+                        side=OrderSide.SELL,
+                        amount=shares,  # For SELL, amount = shares to sell
+                    )
+                    if not result.success:
+                        print(f"    ❌ LIVE ORDER FAILED: {result.error} (latency: {result.latency_ms:.0f}ms)")
+                        return
+                    # Use actual fill price if available
+                    if result.price > 0:
+                        exit_price = result.price
+                    print(f"    ✅ LIVE SELL UP: {result.order_id} | filled: {result.size_matched:.2f} @ {exit_price:.4f} | {result.latency_ms:.0f}ms")
+
+                pnl = (exit_price - pos.entry_price) * shares
+                self._record_trade(pos, exit_price, pnl, "CLOSE UP", cid=cid)
+                self.pending_rewards[cid] = pnl
                 pos.size = 0
                 pos.side = None
                 return
 
             elif action.is_buy and pos.side == "DOWN":
-                exit_down_price = 1 - price  # Current DOWN token price
                 shares = pos.size / pos.entry_price
-                pnl = (exit_down_price - pos.entry_price) * shares  # DOWN token went up = profit
-                self._record_trade(pos, price, pnl, "CLOSE DOWN", cid=cid)
-                self.pending_rewards[cid] = pnl  # Pure realized PnL reward
+                exit_down_price = 1 - price  # Default to mid-price
+
+                # Live: execute sell order for DOWN token
+                if self.live and self.wallet:
+                    result = self.wallet.place_market_order(
+                        token_id=market.token_down,
+                        side=OrderSide.SELL,
+                        amount=shares,  # For SELL, amount = shares to sell
+                    )
+                    if not result.success:
+                        print(f"    ❌ LIVE ORDER FAILED: {result.error} (latency: {result.latency_ms:.0f}ms)")
+                        return
+                    # Use actual fill price if available
+                    if result.price > 0:
+                        exit_down_price = result.price
+                    print(f"    ✅ LIVE SELL DOWN: {result.order_id} | filled: {result.size_matched:.2f} @ {exit_down_price:.4f} | {result.latency_ms:.0f}ms")
+
+                pnl = (exit_down_price - pos.entry_price) * shares
+                self._record_trade(pos, 1 - exit_down_price, pnl, "CLOSE DOWN", cid=cid)
+                self.pending_rewards[cid] = pnl
                 pos.size = 0
                 pos.side = None
                 return
@@ -170,23 +229,66 @@ class TradingEngine:
             size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(action.size_multiplier, "")
 
             if action.is_buy:
+                # Default entry price (paper trading uses best ask or mid + slippage)
+                entry_price = state.best_ask or price * 1.01
+                actual_shares = trade_amount / entry_price
+
+                # Live: execute market buy order
+                if self.live and self.wallet:
+                    result = self.wallet.place_market_order(
+                        token_id=market.token_up,
+                        side=OrderSide.BUY,
+                        amount=trade_amount,  # For BUY, amount = dollars to spend
+                    )
+                    if not result.success:
+                        print(f"    ❌ LIVE ORDER FAILED: {result.error} (latency: {result.latency_ms:.0f}ms)")
+                        return
+                    # Use actual fill data
+                    if result.price > 0:
+                        entry_price = result.price
+                        actual_shares = result.size_matched
+                    print(f"    ✅ LIVE BUY UP: {result.order_id} | filled: {actual_shares:.2f} shares @ {entry_price:.4f} | {result.latency_ms:.0f}ms")
+
                 pos.side = "UP"
                 pos.size = trade_amount
-                pos.entry_price = price
+                pos.entry_price = entry_price  # Uses actual fill price in live mode
                 pos.entry_time = datetime.now(timezone.utc)
                 pos.entry_prob = price
                 pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {price:.3f}")
+                mode = "LIVE" if self.live else "PAPER"
+                print(f"    [{mode}] OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {entry_price:.3f}")
                 emit_trade(f"BUY_{size_label}", pos.asset, pos.size)
 
             elif action.is_sell:
+                # Default entry price for DOWN token
+                down_price = 1 - price
+                entry_price = (1 - state.best_bid) if state.best_bid else down_price * 1.01
+                actual_shares = trade_amount / entry_price
+
+                # Live: execute market buy order for DOWN token
+                if self.live and self.wallet:
+                    result = self.wallet.place_market_order(
+                        token_id=market.token_down,
+                        side=OrderSide.BUY,
+                        amount=trade_amount,  # For BUY, amount = dollars to spend
+                    )
+                    if not result.success:
+                        print(f"    ❌ LIVE ORDER FAILED: {result.error} (latency: {result.latency_ms:.0f}ms)")
+                        return
+                    # Use actual fill data
+                    if result.price > 0:
+                        entry_price = result.price
+                        actual_shares = result.size_matched
+                    print(f"    ✅ LIVE BUY DOWN: {result.order_id} | filled: {actual_shares:.2f} shares @ {entry_price:.4f} | {result.latency_ms:.0f}ms")
+
                 pos.side = "DOWN"
                 pos.size = trade_amount
-                pos.entry_price = 1 - price  # DOWN token price = 1 - UP prob
+                pos.entry_price = entry_price  # Uses actual fill price in live mode
                 pos.entry_time = datetime.now(timezone.utc)
-                pos.entry_prob = price  # Keep original UP prob for reference
+                pos.entry_prob = price
                 pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {1 - price:.3f}")
+                mode = "LIVE" if self.live else "PAPER"
+                print(f"    [{mode}] OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {entry_price:.3f}")
                 emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
@@ -437,6 +539,9 @@ class TradingEngine:
                                 cumulative_trades=self.trade_count,
                                 cumulative_wins=self.win_count
                             )
+                        # Checkpoint save after every PPO update (crash protection)
+                        self.strategy.save("rl_model_checkpoint")
+                        print("  [RL] Checkpoint saved")
 
     def _update_dashboard_only(self):
         """Update dashboard state without printing to console."""
@@ -547,6 +652,13 @@ class TradingEngine:
             await asyncio.gather(*tasks)
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass  # Handle in finally
+        except Exception as e:
+            # Catch ANY crash and save model before dying
+            print(f"\n\n❌ CRASH: {e}")
+            if isinstance(self.strategy, RLStrategy) and self.strategy.training:
+                self.strategy.save("rl_model_crash")
+                print("  [RL] Emergency save to rl_model_crash.safetensors")
+            raise  # Re-raise after saving
         finally:
             print("\n\nShutting down...")
             self.running = False
@@ -575,6 +687,8 @@ async def main():
     parser.add_argument("--load", type=str, help="Load RL model from file")
     parser.add_argument("--dashboard", action="store_true", help="Enable web dashboard")
     parser.add_argument("--port", type=int, default=5050, help="Dashboard port")
+    parser.add_argument("--live", action="store_true", help="Enable LIVE trading (real money!)")
+    parser.add_argument("--assets", type=str, default="BTC,ETH,SOL,XRP", help="Comma-separated assets to trade")
 
     args = parser.parse_args()
 
@@ -615,8 +729,27 @@ async def main():
         else:
             strategy.eval()
 
+    # Setup wallet for live trading
+    wallet = None
+    if args.live:
+        wallet = create_wallet()
+        if not wallet:
+            print("ERROR: Live trading requires POLYMARKET_PRIVATE_KEY env var")
+            print("       Export your wallet private key:")
+            print("       export POLYMARKET_PRIVATE_KEY=0x...")
+            return
+
+        # Safety: confirm live trading
+        print("\n⚠️  You are about to trade with REAL MONEY!")
+        print(f"    Strategy: {args.strategy}")
+        print(f"    Trade size: ${args.size}")
+        confirm = input("    Type 'YES' to confirm: ")
+        if confirm != "YES":
+            print("Aborted.")
+            return
+
     # Run
-    engine = TradingEngine(strategy, trade_size=args.size)
+    engine = TradingEngine(strategy, trade_size=args.size, live=args.live, wallet=wallet)
     await engine.run()
 
 
