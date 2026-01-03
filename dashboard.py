@@ -767,7 +767,7 @@ def run_dashboard(host='0.0.0.0', port=None):
     emitter_thread = threading.Thread(target=state_emitter, daemon=True)
     emitter_thread.start()
 
-    socketio.run(app, host=host, port=port, debug=False, use_reloader=False)
+    socketio.run(app, host=host, port=port, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
 
 
 # Monkey-patch for integration with run.py

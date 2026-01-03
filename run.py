@@ -55,11 +55,55 @@ class Position:
 class TradingEngine:
     """
     Paper trading engine with strategy harness.
+    Supports optional live trading via --live flag.
+
+    Safety features:
+    - max_exposure: Maximum total $ in open positions
+    - max_loss: Stop trading if cumulative loss exceeds this amount
+    - reserve_pct: Keep this % of capital untouchable (default 20%)
+    - max_trades_per_min: Rate limit trades (default 10)
     """
 
-    def __init__(self, strategy: Strategy, trade_size: float = 10.0):
+    def __init__(
+        self,
+        strategy: Strategy,
+        trade_size: float = 10.0,
+        live_mode: bool = False,
+        max_exposure: float = None,
+        max_loss: float = None,
+        reserve_pct: float = 0.20,
+        max_trades_per_min: int = 10,
+        starting_balance: float = None,
+    ):
         self.strategy = strategy
         self.trade_size = trade_size
+        self.live_mode = live_mode
+        self.max_exposure = max_exposure  # Maximum total $ in open positions
+        self.max_loss = max_loss  # Stop trading if losses exceed this
+        self.reserve_pct = reserve_pct  # Keep 20% reserve by default
+        self.max_trades_per_min = max_trades_per_min
+        self.starting_balance = starting_balance
+
+        # Trade rate limiting
+        self.recent_trades: List[datetime] = []  # Timestamps of recent trades
+        self.trading_halted = False  # Set True if max_loss exceeded
+        self.halt_reason = ""
+
+        # Live execution setup
+        self.live_executor = None
+        if live_mode:
+            try:
+                from execution import SyncLiveExecutor
+                self.live_executor = SyncLiveExecutor(dry_run=False)
+                print("=" * 60)
+                print("LIVE TRADING MODE - REAL MONEY AT RISK")
+                print(f"  Dry run: {self.live_executor.dry_run}")
+                print(f"  Kill switch: {self.live_executor.kill_switch}")
+                print("=" * 60)
+            except Exception as e:
+                print(f"ERROR: Failed to initialize live executor: {e}")
+                print("Falling back to paper trading.")
+                self.live_mode = False
 
         # Streamers
         self.price_streamer = BinanceStreamer(["BTC", "ETH", "SOL", "XRP"])
@@ -84,6 +128,153 @@ class TradingEngine:
 
         # Logger (for RL training)
         self.logger = get_logger() if isinstance(strategy, RLStrategy) else None
+
+        # Real balance tracking for live mode
+        self.last_balance_check = None
+        self.cached_usdc_balance = starting_balance
+        self.initial_balance_snapshot = None  # Snapshot at start for hard stop
+
+    def get_total_exposure(self) -> float:
+        """Calculate total $ currently in open positions."""
+        total = 0.0
+        for pos in self.positions.values():
+            if pos.size > 0:
+                total += pos.size
+        return total
+
+    def get_real_usdc_balance(self) -> float:
+        """Get actual USDC balance from blockchain (cached for 10 seconds)."""
+        if not self.live_mode:
+            return float('inf')  # Paper trading has unlimited balance
+
+        now = datetime.now(timezone.utc)
+
+        # Use cache if fresh (within 10 seconds)
+        if self.last_balance_check and (now - self.last_balance_check).total_seconds() < 10:
+            return self.cached_usdc_balance
+
+        try:
+            import os
+            from web3 import Web3
+
+            # Load env if needed
+            proxy_address = os.getenv("POLYMARKET_PROXY_ADDRESS")
+            if not proxy_address:
+                return self.cached_usdc_balance or 0
+
+            w3 = Web3(Web3.HTTPProvider('https://polygon-rpc.com'))
+            USDC = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+            usdc_abi = [{"constant":True,"inputs":[{"name":"_owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"balance","type":"uint256"}],"type":"function"}]
+            balance = w3.eth.contract(address=USDC, abi=usdc_abi).functions.balanceOf(Web3.to_checksum_address(proxy_address)).call() / 1e6
+
+            self.cached_usdc_balance = balance
+            self.last_balance_check = now
+            return balance
+        except Exception as e:
+            print(f"    ⚠️ Balance check failed: {e}")
+            return self.cached_usdc_balance or 0
+
+    def can_open_position(self, amount: float) -> bool:
+        """Check if we can open a new position without exceeding max exposure."""
+        if self.max_exposure is None:
+            return True
+        current = self.get_total_exposure()
+        return (current + amount) <= self.max_exposure
+
+    def check_rate_limit(self) -> bool:
+        """Check if we've exceeded the max trades per minute. Returns True if OK to trade."""
+        now = datetime.now(timezone.utc)
+        # Remove trades older than 1 minute
+        self.recent_trades = [t for t in self.recent_trades if (now - t).total_seconds() < 60]
+
+        # Per-minute limit
+        if len(self.recent_trades) >= self.max_trades_per_min:
+            return False
+
+        # BURST PROTECTION: Max 2 trades per second
+        recent_second = [t for t in self.recent_trades if (now - t).total_seconds() < 1]
+        if len(recent_second) >= 2:
+            return False
+
+        return True
+
+    def record_trade_time(self):
+        """Record that a trade was made for rate limiting."""
+        self.recent_trades.append(datetime.now(timezone.utc))
+
+    def check_loss_limit(self) -> bool:
+        """Check if we've exceeded max loss. Returns True if OK to trade."""
+        if self.max_loss is None:
+            return True
+        if self.total_pnl < -abs(self.max_loss):
+            self.trading_halted = True
+            self.halt_reason = f"Max loss ${self.max_loss:.2f} exceeded (current: ${self.total_pnl:.2f})"
+            return False
+        return True
+
+    def get_available_capital(self) -> float:
+        """Get capital available for trading (after reserve)."""
+        if self.starting_balance is None:
+            return float('inf')  # Paper trading, no limit
+        reserved = self.starting_balance * self.reserve_pct
+        current_exposure = self.get_total_exposure()
+        available = self.starting_balance - reserved - current_exposure + self.total_pnl
+        return max(0, available)
+
+    def can_trade(self, amount: float) -> tuple[bool, str]:
+        """
+        Master safety check - returns (can_trade, reason).
+        Combines all safety checks into one.
+        """
+        # Check if trading is halted
+        if self.trading_halted:
+            return False, f"HALTED: {self.halt_reason}"
+
+        # Check rate limit FIRST (cheap check)
+        if not self.check_rate_limit():
+            return False, f"Rate limit: {len(self.recent_trades)}/{self.max_trades_per_min} trades/min"
+
+        # CRITICAL: Check REAL USDC balance for live trading
+        if self.live_mode:
+            real_balance = self.get_real_usdc_balance()
+
+            # Take initial snapshot on first check
+            if self.initial_balance_snapshot is None:
+                self.initial_balance_snapshot = real_balance
+                print(f"    📸 Initial balance snapshot: ${real_balance:.2f}")
+
+            # HARD STOP #1: If real balance dropped more than max_loss from snapshot
+            if self.max_loss and self.initial_balance_snapshot:
+                actual_loss = self.initial_balance_snapshot - real_balance
+                if actual_loss > self.max_loss:
+                    self.trading_halted = True
+                    self.halt_reason = f"HARD STOP: Lost ${actual_loss:.2f} (max: ${self.max_loss:.2f})"
+                    print(f"\n🛑 {self.halt_reason}")
+                    return False, self.halt_reason
+
+            # HARD STOP #2: If balance below reserve
+            if self.starting_balance:
+                min_balance = self.starting_balance * self.reserve_pct
+                if real_balance < min_balance:
+                    self.trading_halted = True
+                    self.halt_reason = f"Balance ${real_balance:.2f} below reserve ${min_balance:.2f}"
+                    print(f"\n🛑 {self.halt_reason}")
+                    return False, self.halt_reason
+
+            # Check if we have enough for this trade
+            if real_balance < amount:
+                return False, f"Insufficient USDC: ${real_balance:.2f} < ${amount:.2f} needed"
+
+        # Check loss limit (paper P&L)
+        if not self.check_loss_limit():
+            return False, f"Loss limit exceeded: ${self.total_pnl:.2f}"
+
+        # Check max exposure (paper positions)
+        if not self.can_open_position(amount):
+            current = self.get_total_exposure()
+            return False, f"Max exposure: ${current:.0f}/${self.max_exposure:.0f}"
+
+        return True, "OK"
 
     def refresh_markets(self):
         """Find active 15-min markets."""
@@ -133,20 +324,94 @@ class TradingEngine:
             self.orderbook_streamer.clear_stale(active_cids)
 
     def execute_action(self, cid: str, action: Action, state: MarketState):
-        """Execute paper trade with flexible sizing."""
+        """Execute paper trade (and optionally live trade) with flexible sizing."""
         if action == Action.HOLD:
             return
 
         pos = self.positions.get(cid)
-        if not pos:
+        market = self.markets.get(cid)
+        if not pos or not market:
             return
 
+        # ============================================================
+        # SAFETY CHECKS FIRST - Before any calculations
+        # ============================================================
+
+        # Check if trading is halted
+        if self.trading_halted:
+            print(f"    🛑 HALTED: {self.halt_reason}")
+            return
+
+        # Check rate limit (includes burst protection)
+        if not self.check_rate_limit():
+            return  # Silent - don't spam logs
+
+        # For OPENING new positions only - check exposure limits
+        if pos.size == 0:
+            # Calculate proposed trade amount with HARD CAPS
+            size_multiplier = min(action.size_multiplier, 1.0)  # Cap at 1x
+            trade_amount = min(self.trade_size * size_multiplier, self.trade_size)
+
+            # Check max exposure using ACTUAL open positions
+            if self.max_exposure:
+                current_exposure = self.get_total_exposure()
+                available_exposure = self.max_exposure - current_exposure
+                if available_exposure <= 0:
+                    print(f"    🛑 MAX EXPOSURE: ${current_exposure:.0f}/${self.max_exposure:.0f} (no room)")
+                    return
+                # Cap trade to available exposure
+                trade_amount = min(trade_amount, available_exposure)
+
+            # Check real USDC balance for live mode
+            if self.live_mode:
+                real_balance = self.get_real_usdc_balance()
+
+                # Take snapshot on first trade
+                if self.initial_balance_snapshot is None:
+                    self.initial_balance_snapshot = real_balance
+                    print(f"    📸 Initial balance: ${real_balance:.2f}")
+
+                # Hard stop: loss exceeded
+                if self.max_loss and self.initial_balance_snapshot:
+                    actual_loss = self.initial_balance_snapshot - real_balance
+                    if actual_loss >= self.max_loss:
+                        self.trading_halted = True
+                        self.halt_reason = f"Lost ${actual_loss:.2f} (limit: ${self.max_loss:.2f})"
+                        print(f"    🛑 {self.halt_reason}")
+                        return
+
+                # Check sufficient balance
+                if real_balance < trade_amount:
+                    print(f"    🛑 INSUFFICIENT: ${real_balance:.2f} < ${trade_amount:.2f}")
+                    return
+        else:
+            # For CLOSING positions, use existing position size
+            trade_amount = pos.size
+
+        # ============================================================
+        # EXECUTION - Only reached if all safety checks pass
+        # ============================================================
+
         price = state.prob
-        trade_amount = self.trade_size * action.size_multiplier
 
         # Close existing position if switching sides
         if pos.size > 0:
             if action.is_sell and pos.side == "UP":
+                # Live execution: sell UP token
+                if self.live_mode and self.live_executor:
+                    result = self.live_executor.execute_trade(
+                        condition_id=cid,
+                        token_id=market.token_up,
+                        outcome="Up",
+                        side="sell",
+                        size_usd=pos.size,
+                        limit_price=price,
+                    )
+                    if result.success:
+                        print(f"    LIVE CLOSE UP: {result.order_id}")
+                    else:
+                        print(f"    LIVE CLOSE UP FAILED: {result.error}")
+
                 shares = pos.size / pos.entry_price
                 pnl = (price - pos.entry_price) * shares
                 self._record_trade(pos, price, pnl, "CLOSE UP", cid=cid)
@@ -157,6 +422,22 @@ class TradingEngine:
 
             elif action.is_buy and pos.side == "DOWN":
                 exit_down_price = 1 - price  # Current DOWN token price
+
+                # Live execution: sell DOWN token
+                if self.live_mode and self.live_executor:
+                    result = self.live_executor.execute_trade(
+                        condition_id=cid,
+                        token_id=market.token_down,
+                        outcome="Down",
+                        side="sell",
+                        size_usd=pos.size,
+                        limit_price=exit_down_price,
+                    )
+                    if result.success:
+                        print(f"    LIVE CLOSE DOWN: {result.order_id}")
+                    else:
+                        print(f"    LIVE CLOSE DOWN FAILED: {result.error}")
+
                 shares = pos.size / pos.entry_price
                 pnl = (exit_down_price - pos.entry_price) * shares  # DOWN token went up = profit
                 self._record_trade(pos, price, pnl, "CLOSE DOWN", cid=cid)
@@ -165,28 +446,66 @@ class TradingEngine:
                 pos.side = None
                 return
 
-        # Open new position
+        # Open new position (safety already checked at top of function)
         if pos.size == 0:
             size_label = {0.25: "SM", 0.5: "MD", 1.0: "LG"}.get(action.size_multiplier, "")
 
             if action.is_buy:
+                # Live execution: buy UP token
+                if self.live_mode and self.live_executor:
+                    result = self.live_executor.execute_trade(
+                        condition_id=cid,
+                        token_id=market.token_up,
+                        outcome="Up",
+                        side="buy",
+                        size_usd=trade_amount,
+                        limit_price=price,
+                    )
+                    if result.success:
+                        print(f"    LIVE BUY UP: {result.order_id}")
+                    else:
+                        print(f"    LIVE BUY UP FAILED: {result.error}")
+                        return  # Don't update paper position on live failure
+
                 pos.side = "UP"
                 pos.size = trade_amount
                 pos.entry_price = price
                 pos.entry_time = datetime.now(timezone.utc)
                 pos.entry_prob = price
                 pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {price:.3f}")
+                self.record_trade_time()  # Rate limit tracking
+                current_exposure = self.get_total_exposure()
+                print(f"    OPEN {pos.asset} UP ({size_label}) ${trade_amount:.0f} @ {price:.3f} [exposure: ${current_exposure:.0f}/${self.max_exposure or 999:.0f}]")
                 emit_trade(f"BUY_{size_label}", pos.asset, pos.size)
 
             elif action.is_sell:
+                down_price = 1 - price  # DOWN token price = 1 - UP prob
+
+                # Live execution: buy DOWN token
+                if self.live_mode and self.live_executor:
+                    result = self.live_executor.execute_trade(
+                        condition_id=cid,
+                        token_id=market.token_down,
+                        outcome="Down",
+                        side="buy",
+                        size_usd=trade_amount,
+                        limit_price=down_price,
+                    )
+                    if result.success:
+                        print(f"    LIVE BUY DOWN: {result.order_id}")
+                    else:
+                        print(f"    LIVE BUY DOWN FAILED: {result.error}")
+                        return  # Don't update paper position on live failure
+
                 pos.side = "DOWN"
                 pos.size = trade_amount
-                pos.entry_price = 1 - price  # DOWN token price = 1 - UP prob
+                pos.entry_price = down_price
                 pos.entry_time = datetime.now(timezone.utc)
                 pos.entry_prob = price  # Keep original UP prob for reference
                 pos.time_remaining_at_entry = state.time_remaining
-                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {1 - price:.3f}")
+                self.record_trade_time()  # Rate limit tracking
+                current_exposure = self.get_total_exposure()
+                print(f"    OPEN {pos.asset} DOWN ({size_label}) ${trade_amount:.0f} @ {down_price:.3f} [exposure: ${current_exposure:.0f}/${self.max_exposure or 999:.0f}]")
                 emit_trade(f"SELL_{size_label}", pos.asset, pos.size)
 
     def _record_trade(self, pos: Position, price: float, pnl: float, action: str, cid: str = None):
@@ -476,9 +795,27 @@ class TradingEngine:
         """Print current status."""
         now = datetime.now(timezone.utc)
         win_rate = self.win_count / max(1, self.trade_count) * 100
+        exposure = self.get_total_exposure()
+
+        # Clean up old trades from rate limit tracker
+        self.recent_trades = [t for t in self.recent_trades if (now - t).total_seconds() < 60]
 
         print(f"\n[{now.strftime('%H:%M:%S')}] {self.strategy.name.upper()}")
         print(f"  PnL: ${self.total_pnl:+.2f} | Trades: {self.trade_count} | Win: {win_rate:.0f}%")
+
+        # Safety status line
+        safety_parts = []
+        if self.max_exposure:
+            safety_parts.append(f"Exp: ${exposure:.0f}/${self.max_exposure:.0f}")
+        if self.max_loss:
+            pnl_pct = (self.total_pnl / abs(self.max_loss) * 100) if self.max_loss else 0
+            safety_parts.append(f"Loss: ${self.total_pnl:.0f}/${-self.max_loss:.0f}")
+        safety_parts.append(f"Rate: {len(self.recent_trades)}/{self.max_trades_per_min}/min")
+        if self.trading_halted:
+            safety_parts.append("⛔ HALTED")
+
+        if safety_parts:
+            print(f"  [{' | '.join(safety_parts)}]")
 
         # Prepare dashboard data
         dashboard_markets = {}
@@ -575,6 +912,13 @@ async def main():
     parser.add_argument("--load", type=str, help="Load RL model from file")
     parser.add_argument("--dashboard", action="store_true", help="Enable web dashboard")
     parser.add_argument("--port", type=int, default=5050, help="Dashboard port")
+    parser.add_argument("--live", action="store_true", help="Enable LIVE trading on Polymarket (REAL MONEY)")
+    parser.add_argument("--confirm", action="store_true", help="Skip interactive confirmation for live trading")
+    parser.add_argument("--max-exposure", type=float, default=10.0, help="Maximum total $ in open positions (default: 10)")
+    parser.add_argument("--max-loss", type=float, default=None, help="Stop trading if losses exceed this $ amount")
+    parser.add_argument("--reserve", type=float, default=0.20, help="Keep this fraction of capital as reserve (default: 0.20 = 20%%)")
+    parser.add_argument("--max-trades-per-min", type=int, default=10, help="Maximum trades per minute (default: 10)")
+    parser.add_argument("--balance", type=float, default=None, help="Starting balance for capital checks (required for --live)")
 
     args = parser.parse_args()
 
@@ -615,8 +959,58 @@ async def main():
         else:
             strategy.eval()
 
+    # Live trading safety confirmation
+    live_mode = False
+    if args.live:
+        # Require balance for live trading
+        if args.balance is None:
+            print("\nERROR: --balance is required for live trading")
+            print("Example: python run.py rl --live --balance 50")
+            return
+
+        # Set sensible defaults for live trading if not specified
+        max_loss = args.max_loss if args.max_loss else args.balance * 0.5  # Default: stop at 50% loss
+
+        print("\n" + "=" * 60)
+        print("⚠️  LIVE TRADING MODE - REAL MONEY AT RISK ⚠️")
+        print("=" * 60)
+        print("\nSAFETY LIMITS:")
+        print(f"  💰 Starting balance:    ${args.balance:.2f}")
+        print(f"  📊 Max exposure:        ${args.max_exposure:.2f} (total open positions)")
+        print(f"  🛑 Max loss limit:      ${max_loss:.2f} (trading halts if exceeded)")
+        print(f"  🏦 Capital reserve:     {args.reserve*100:.0f}% (${args.balance * args.reserve:.2f} untouchable)")
+        print(f"  ⏱️  Rate limit:          {args.max_trades_per_min} trades/minute")
+        print(f"  💵 Trade size:          ${args.size:.2f} per trade")
+        print("\nPRE-FLIGHT CHECKLIST:")
+        print("  ✓ .env configured with Polymarket credentials")
+        print("  ✓ Tested in paper trading mode")
+        print("  ✓ Account has sufficient balance")
+        print("  ✓ VPN connected (Oslo recommended)")
+        print()
+
+        if args.confirm:
+            print("Live trading confirmed via --confirm flag")
+        else:
+            confirm = input("Type 'LIVE' to confirm live trading: ")
+            if confirm.strip() != "LIVE":
+                print("Live trading cancelled.")
+                return
+
+        print("\n🚀 Starting LIVE trading...")
+        live_mode = True
+        args.max_loss = max_loss  # Apply default if not set
+
     # Run
-    engine = TradingEngine(strategy, trade_size=args.size)
+    engine = TradingEngine(
+        strategy,
+        trade_size=args.size,
+        live_mode=live_mode,
+        max_exposure=args.max_exposure,
+        max_loss=args.max_loss,
+        reserve_pct=args.reserve,
+        max_trades_per_min=args.max_trades_per_min,
+        starting_balance=args.balance,
+    )
     await engine.run()
 
 

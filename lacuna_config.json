@@ -1,0 +1,81 @@
+{
+  "model_type": "ppo_temporal",
+  "version": "5.0",
+  "name": "LACUNA",
+  "description": "Cross-market data fusion RL agent for prediction market trading",
+
+  "architecture": {
+    "type": "asymmetric_actor_critic",
+    "temporal_encoder": {
+      "history_length": 5,
+      "hidden_size": 128
+    },
+    "actor": {
+      "hidden_layers": [256, 128],
+      "activation": "tanh"
+    },
+    "critic": {
+      "hidden_layers": [256, 128],
+      "activation": "tanh"
+    }
+  },
+
+  "observation_space": {
+    "dimensions": 18,
+    "features": [
+      {"name": "return_1m", "category": "momentum"},
+      {"name": "return_5m", "category": "momentum"},
+      {"name": "return_10m", "category": "momentum"},
+      {"name": "l1_imbalance", "category": "order_flow"},
+      {"name": "l5_imbalance", "category": "order_flow"},
+      {"name": "trade_flow", "category": "order_flow"},
+      {"name": "cvd_acceleration", "category": "order_flow"},
+      {"name": "spread_pct", "category": "microstructure"},
+      {"name": "trade_intensity", "category": "microstructure"},
+      {"name": "large_trade_flag", "category": "microstructure"},
+      {"name": "vol_5m", "category": "volatility"},
+      {"name": "vol_expansion", "category": "volatility"},
+      {"name": "has_position", "category": "position"},
+      {"name": "position_side", "category": "position"},
+      {"name": "position_pnl", "category": "position"},
+      {"name": "time_remaining", "category": "position"},
+      {"name": "vol_regime", "category": "regime"},
+      {"name": "trend_regime", "category": "regime"}
+    ]
+  },
+
+  "action_space": {
+    "type": "discrete",
+    "actions": ["HOLD", "BUY_UP", "BUY_DOWN"]
+  },
+
+  "training": {
+    "algorithm": "PPO",
+    "entropy_coefficient": 0.10,
+    "learning_rate": 0.0003,
+    "gamma": 0.99,
+    "gae_lambda": 0.95,
+    "clip_range": 0.2,
+    "n_epochs": 10,
+    "batch_size": 64,
+    "buffer_size": 2048
+  },
+
+  "constraints": {
+    "position_size_usd": 500,
+    "max_exposure_usd": 2000,
+    "max_concurrent_positions": 4,
+    "markets": ["BTC", "ETH", "SOL", "XRP"],
+    "market_type": "15-minute crypto prediction"
+  },
+
+  "performance": {
+    "total_pnl_usd": 50195,
+    "return_on_exposure_pct": 2510,
+    "sharpe_ratio": 4.13,
+    "profit_factor": 1.21,
+    "total_trades": 29176,
+    "win_rate_pct": 23.9,
+    "runtime_hours": 10
+  }
+}
