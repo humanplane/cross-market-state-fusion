@@ -1,0 +1,19 @@
+# Core ML (PyTorch - works on Windows/Linux/Mac)
+torch>=2.0.0
+numpy>=1.24.0
+safetensors>=0.4.0
+
+# Web/API
+aiohttp>=3.9.0
+websockets>=12.0
+requests>=2.31.0
+
+# Dashboard
+flask>=3.0.0
+flask-socketio>=5.3.0
+python-socketio>=5.10.0
+eventlet>=0.35.0
+
+# Utils
+python-dotenv>=1.0.0
+
