@@ -282,10 +282,21 @@ class TradingEngine:
             if not self.markets:
                 print("\nAll markets expired. Refreshing...")
                 self.close_all_positions()
-                self.refresh_markets()
-                if not self.markets:
-                    print("No new markets. Waiting...")
-                    await asyncio.sleep(30)
+
+                # Persistent retry loop - never give up, markets will come back
+                retry_count = 0
+                while not self.markets and self.running:
+                    self.refresh_markets()
+                    if not self.markets:
+                        retry_count += 1
+                        # Exponential backoff: 5s, 10s, 15s, ... up to 60s max
+                        wait_time = min(5 * retry_count, 60)
+                        print(f"No markets found. Retry #{retry_count} in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+
+                        # Reset counter periodically to avoid huge numbers in logs
+                        if retry_count >= 20:
+                            retry_count = 10
                 continue
 
             # Update states and make decisions
@@ -532,9 +543,21 @@ class TradingEngine:
         self.running = True
         self.refresh_markets()
 
+        # Persistent retry at startup - never give up, markets will come back
         if not self.markets:
-            print("No markets to trade!")
-            return
+            print("No markets found at startup. Waiting for markets...")
+            retry_count = 0
+            while not self.markets and self.running:
+                retry_count += 1
+                wait_time = min(5 * retry_count, 60)
+                print(f"Retry #{retry_count} in {wait_time}s...")
+                await asyncio.sleep(wait_time)
+                self.refresh_markets()
+                if retry_count >= 20:
+                    retry_count = 10
+
+            if not self.running:
+                return
 
         tasks = [
             self.price_streamer.stream(),
